@@ -1,3 +1,4 @@
+
 /*
  * composite.c - infrastructure for Composite USB Gadgets
  *
