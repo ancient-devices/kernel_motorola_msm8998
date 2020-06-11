@@ -1,3 +1,5 @@
+
+
 /*
  *  linux/drivers/mmc/host/sdhci.c - Secure Digital Host Controller Interface driver
  *
@@ -111,19 +113,6 @@ static void sdhci_dump_state(struct sdhci_host *host)
 
 static void sdhci_dumpregs(struct sdhci_host *host)
 {
-	if((host->mmc)&&(host->mmc->card)){
-		if (mmc_card_mmc(host->mmc->card)) {
-			if (host->mmc->card->ext_csd.rev < 7) {
-				 pr_info(DRIVER_NAME " mid %x\n", host->mmc->card->cid.manfid);
-				 pr_info(DRIVER_NAME " FW 0x%x\n", host->mmc->card->cid.fwrev);
-			} else {
-				pr_info(DRIVER_NAME " mid 0x%x\n", host->mmc->card->cid.manfid);
-				pr_info(DRIVER_NAME " FW 0x%*phN\n", MMC_FIRMWARE_LEN,
-					host->mmc->card->ext_csd.fwrev);
-			}
-		}
-	}
-
 	MMC_TRACE(host->mmc,
 		"%s: 0x04=0x%08x 0x06=0x%08x 0x0E=0x%08x 0x30=0x%08x 0x34=0x%08x 0x38=0x%08x\n",
 		__func__,
@@ -198,11 +187,6 @@ static void sdhci_dumpregs(struct sdhci_host *host)
 		host->ops->dump_vendor_regs(host);
 	sdhci_dump_state(host);
 	pr_info(DRIVER_NAME ": ===========================================\n");
-
-#ifdef CONFIG_SDHCI_DUMPREG_DEBUG_PANIC
-	if (mmc_card_mmc(host->mmc->card))
-		BUG_ON(true);
-#endif
 }
 
 /*****************************************************************************\
@@ -1471,24 +1455,25 @@ clock_set:
 }
 EXPORT_SYMBOL_GPL(sdhci_set_clock);
 
-static void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
-			    unsigned short vdd)
+static void sdhci_set_power_reg(struct sdhci_host *host, unsigned char mode,
+				unsigned short vdd)
 {
 	struct mmc_host *mmc = host->mmc;
+
+	spin_unlock_irq(&host->lock);
+	mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, vdd);
+	spin_lock_irq(&host->lock);
+
+	if (mode != MMC_POWER_OFF)
+		sdhci_writeb(host, SDHCI_POWER_ON, SDHCI_POWER_CONTROL);
+	else
+		sdhci_writeb(host, 0, SDHCI_POWER_CONTROL);
+}
+
+void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
+		     unsigned short vdd)
+{
 	u8 pwr = 0;
-
-	if (!IS_ERR(mmc->supply.vmmc)) {
-		spin_unlock_irq(&host->lock);
-		mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, vdd);
-		spin_lock_irq(&host->lock);
-
-		if (mode != MMC_POWER_OFF)
-			sdhci_writeb(host, SDHCI_POWER_ON, SDHCI_POWER_CONTROL);
-		else
-			sdhci_writeb(host, 0, SDHCI_POWER_CONTROL);
-
-		return;
-	}
 
 	if (mode != MMC_POWER_OFF) {
 		switch (1 << vdd) {
@@ -1521,7 +1506,6 @@ static void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
 			host->ops->check_power_status(host, REQ_BUS_OFF);
 		if (host->quirks2 & SDHCI_QUIRK2_CARD_ON_NEEDS_BUS_ON)
 			sdhci_runtime_pm_bus_off(host);
-		vdd = 0;
 	} else {
 		/*
 		 * Spec says that we should clear the power reg before setting
@@ -1559,6 +1543,20 @@ static void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
 		if (host->quirks & SDHCI_QUIRK_DELAY_AFTER_POWER)
 			mdelay(10);
 	}
+}
+EXPORT_SYMBOL_GPL(sdhci_set_power);
+
+static void __sdhci_set_power(struct sdhci_host *host, unsigned char mode,
+			      unsigned short vdd)
+{
+	struct mmc_host *mmc = host->mmc;
+
+	if (host->ops->set_power)
+		host->ops->set_power(host, mode, vdd);
+	else if (!IS_ERR(mmc->supply.vmmc))
+		sdhci_set_power_reg(host, mode, vdd);
+	else
+		sdhci_set_power(host, mode, vdd);
 }
 
 /*****************************************************************************\
@@ -1740,13 +1738,9 @@ static void sdhci_request(struct mmc_host *mmc, struct mmc_request *mrq)
 
 	sdhci_runtime_pm_get(host);
 	if (sdhci_check_state(host)) {
-		if (sdhci_do_get_cd(host)) {
-			sdhci_dump_state(host);
-			pr_err("%s: sdhci in bad state\n",
-				mmc_hostname(host->mmc));
-		} else
-			pr_warn("%s(%s): card removed\n",
-				__func__, mmc_hostname(mmc));
+		sdhci_dump_state(host);
+		pr_err("%s: sdhci in bad state\n",
+			mmc_hostname(host->mmc));
 		mrq->cmd->error = -EIO;
 		if (mrq->data)
 			mrq->data->error = -EIO;
@@ -1974,7 +1968,7 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
 	if (!host->ops->enable_controller_clock && (ios->power_mode &
 						    (MMC_POWER_UP |
 						     MMC_POWER_ON)))
-		sdhci_set_power(host, ios->power_mode, ios->vdd);
+		__sdhci_set_power(host, ios->power_mode, ios->vdd);
 
 	spin_lock_irqsave(&host->lock, flags);
 
